@@ -1,16 +1,15 @@
-# DMADNet
+# HFA-Net
 
-`DMADNet` is a clear, simple, self-contained open source project for multimodal 3D object detection.
+`HFA-Net` is a clear, simple, self-contained open source project for multimodal 3D object detection.
 
 **Highlights**: 
 * 
 * The codes of  has been supported.
-* The codes of  has been supported. 
 * The multi-modal 3D detection approaches on Nuscenes have been supported. 
 
 ## License
 
-`DMADNet` is released under the [Apache 2.0 license](LICENSE).
+`HFA-Net` is released under the [Apache 2.0 license](LICENSE).
 
 ## Acknowledgement
 
