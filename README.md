@@ -11,7 +11,7 @@ We have proposed HFA-Net（HFA-Net:Hierarchical Feature Alignment Network for Mu
 ### Installation
 1.  Prepare for the running environment. 
 
-    You can  follow the installation steps in [`OpenPCDet`](https://github.com/open-mmlab/OpenPCDet). We use 1 RTX-3090 or 4 RTX-4090 GPUs to train our MPCF.
+    You can  follow the installation steps in [`OpenPCDet`](https://github.com/open-mmlab/OpenPCDet). We use 1 RTX-4090 GPU to train our HFA-Net.
 
 2. Prepare for the data.  
     
