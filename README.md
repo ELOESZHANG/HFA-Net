@@ -52,9 +52,6 @@ We have proposed HFA-Net（HFA-Net:Hierarchical Feature Alignment Network for Mu
     cd HFA-Net
     python setup.py develop
     
-    cd pcdet/ops/iou3d/cuda_op
-    python setup.py develop
-
     ```
     
 ### Getting Started
