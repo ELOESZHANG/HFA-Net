@@ -1,7 +1,7 @@
 # HFA-Net
 
 We have proposed HFA-Net（HFA-Net:Hierarchical Feature Alignment Network for Multimodal 3D Object Detection）, which is used for three-dimensional object detection that integrates camera and point cloud modalities.
-![HFA-Net](./HFA-Net.png)
+![HFA-Net](./image/HFA-Net.png)
 
 **Highlights**: 
 * HFA-Net effectively addresses the problem of hierarchical feature misalignment.
