@@ -1,264 +1,137 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import os
 from pcdet.utils.spconv_utils import spconv
 from pcdet.ops.roiaware_pool3d.roiaware_pool3d_utils import points_in_boxes_gpu
 from pcdet.models.backbones_3d.focal_sparse_conv.focal_sparse_utils import split_voxels, check_repeat, FocalLoss
 from pcdet.utils import common_utils
 
 
-class ASPP(nn.Module):
-    def __init__(self):
-        super(ASPP, self).__init__()
-        # global average pooling : init nn.AdaptiveAvgPool2d ;also forward torch.mean(,,keep_dim=True)
-        self.mean = nn.AdaptiveAvgPool2d((1, 1))
-        self.inchannel = 16
-        self.depth = 8
-        self.conv = nn.Conv2d(self.inchannel, self.depth, 1, 1)
-        # k=1 s=1 no pad
-        self.atrous_block1 = nn.Conv2d(self.inchannel, self.depth, 1, 1)  # 不同空洞率的卷积
-        self.atrous_block6 = nn.Conv2d(self.inchannel, self.depth, 3, 1, padding=6, dilation=6)
-        self.atrous_block12 = nn.Conv2d(self.inchannel, self.depth, 3, 1, padding=12, dilation=12)
-        self.atrous_block18 = nn.Conv2d(self.inchannel, self.depth, 3, 1, padding=18, dilation=18)
-
-        self.conv_1x1_output = nn.Conv2d(self.depth * 5, self.inchannel, 1, 1)
+class Mish(nn.Module):
+    """Mish激活函数：平滑非单调，增强梯度流"""
 
     def forward(self, x):
-        size = x.shape[2:]
-
-        image_features = self.mean(x)  # 池化分支
-        image_features = self.conv(image_features)
-        image_features = F.upsample(image_features, size=size, mode='bilinear')
-
-        atrous_block1 = self.atrous_block1(x)
-
-        atrous_block6 = self.atrous_block6(x)
-
-        atrous_block12 = self.atrous_block12(x)
-
-        atrous_block18 = self.atrous_block18(x)
-
-        net = self.conv_1x1_output(torch.cat([image_features, atrous_block1, atrous_block6,
-                                              atrous_block12, atrous_block18], dim=1))  # 汇合所有尺度的特征，利用1X1卷积融合特征输出
-        return net
+        return x * torch.tanh(F.softplus(x))
 
 
-class SE(nn.Module):
-    # ratio代表第一个全连接下降通道的倍数
-    def __init__(self, in_channel, ratio=4):
+class DPWS(nn.Module):
+    def __init__(self, in_channel, num_heads=2, reduction=4):
         super().__init__()
+        self.in_channel = in_channel
+        self.reduction = reduction
 
-        # 全局平均池化，输出的特征图的宽高=1
-        self.avg_pool = nn.AdaptiveAvgPool2d(output_size=1)
+        self.downsampling = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_max_pool = nn.AdaptiveMaxPool2d(1)
+        self.conv_pool = nn.Conv2d(in_channel, in_channel, kernel_size=3, padding=1, stride=2, groups=in_channel,
+                                   bias=False)
 
-        # 第一个全连接层将特征图的通道数下降4倍
-        self.fc1 = nn.Linear(in_features=in_channel, out_features=in_channel // ratio, bias=False)
+        self.conv_for_q = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1)
+        self.conv_for_k = nn.Conv2d(in_channel, in_channel, kernel_size=3, padding=1, stride=2)
+        self.conv_for_v = nn.Conv2d(in_channel, in_channel, kernel_size=5, padding=2, stride=2)
 
-        # relu激活，可自行换别的激活函数
-        self.relu = nn.ReLU()
+        self.attention = nn.MultiheadAttention(embed_dim=in_channel, num_heads=num_heads)
+        self.silu = nn.SiLU()
 
-        # 第二个全连接层恢复通道数
-        self.fc2 = nn.Linear(in_features=in_channel // ratio, out_features=in_channel, bias=False)
-
-        # sigmoid激活函数，将权值归一化到0-1
-        self.sigmoid = nn.Sigmoid()
-
-    # 前向传播
-    def forward(self, inputs):  # inputs 代表输入特征图
-
-        b, c, h, w = inputs.shape
-
-        # 全局平均池化 [b,c,h,w]==>[b,c,1,1]
-        x = self.avg_pool(inputs)
-
-        # 维度调整 [b,c,1,1]==>[b,c]
-        x = x.view([b, c])
-
-        # 第一个全连接下降通道 [b,c]==>[b,c//4]
-        x = self.fc1(x)
-
-        x = self.relu(x)
-
-        # 第二个全连接上升通道 [b,c//4]==>[b,c]
-        x = self.fc2(x)
-
-        # 对通道权重归一化处理
-        x = self.sigmoid(x)
-
-        # 调整维度 [b,c]==>[b,c,1,1]
-        x = x.view([b, c, 1, 1])
-
-        # 将输入特征图和通道权重相乘
-        outputs = x * inputs
-        return outputs
-
-
-# 空间注意力机制
-class spatial_attention(nn.Module):
-    # 卷积核大小为7*7
-    def __init__(self, kernel_size=7):
-        super().__init__()
-
-        # 为了保持卷积前后的特征图shape相同，卷积时需要padding
-        padding = kernel_size // 2
-
-        # 7*7卷积融合通道信息 [b,2,h,w]==>[b,1,h,w]
-        self.conv = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=kernel_size,
-                              padding=padding, bias=False)
-        # sigmoid函数
-        self.sigmoid = nn.Sigmoid()
-
-    # 前向传播
-    def forward(self, inputs):
-        # 在通道维度上最大池化 [b,1,h,w]  keepdim保留原有深度
-        # 返回值是在某维度的最大值和对应的索引
-        x_maxpool, _ = torch.max(inputs, dim=1, keepdim=True)
-
-        # 在通道维度上平均池化 [b,1,h,w]
-        x_avgpool = torch.mean(inputs, dim=1, keepdim=True)
-        # 池化后的结果在通道维度上堆叠 [b,2,h,w]
-        x = torch.cat([x_maxpool, x_avgpool], dim=1)
-
-        # 卷积融合通道信息 [b,2,h,w]==>[b,1,h,w]
-        x = self.conv(x)
-
-        # 空间权重归一化
-        x = self.sigmoid(x)
-
-        # 输入特征图和空间权重相乘
-        outputs = inputs * x
-
-        return outputs
-
-
-# 通道注意力机制
-class channel_attention(nn.Module):
-    # ratio代表第一个全连接的通道下降倍数
-    def __init__(self, in_channel, ratio=4):
-        super().__init__()
-
-        # 全局最大池化 [b,c,h,w]==>[b,c,1,1]
-        self.max_pool = nn.AdaptiveMaxPool2d(output_size=1)
-        # 全局平均池化 [b,c,h,w]==>[b,c,1,1]
-        self.avg_pool = nn.AdaptiveAvgPool2d(output_size=1)
-
-        # 第一个全连接层, 通道数下降4倍（可以换成1x1的卷积，效果相同）
-        self.fc1 = nn.Linear(in_features=in_channel, out_features=in_channel // ratio, bias=False)
-        # 第二个全连接层, 恢复通道数（可以换成1x1的卷积，效果相同）
-        self.fc2 = nn.Linear(in_features=in_channel // ratio, out_features=in_channel, bias=False)
-
-        # relu激活函数
-        self.relu = nn.ReLU()
-
-        # sigmoid激活函数
-        self.sigmoid = nn.Sigmoid()
-
-    # 前向传播
     def forward(self, inputs):
         b, c, h, w = inputs.shape
 
-        # 输入图像做全局最大池化 [b,c,h,w]==>[b,c,1,1]
-        max_pool = self.max_pool(inputs)
+        avg_pool = self.global_avg_pool(inputs)
+        max_pool = self.global_max_pool(inputs)
+        conv_pool_0 = self.conv_pool(inputs)
+        conv_pool = conv_pool_0.mean([2, 3], keepdim=True)
 
-        # 输入图像的全局平均池化 [b,c,h,w]==>[b,c,1,1]
-        avg_pool = self.avg_pool(inputs)
+        q = self.conv_for_q(inputs)
+        k = self.conv_for_k(inputs)
+        v = self.conv_for_v(inputs)
 
-        # 调整池化结果的维度 [b,c,1,1]==>[b,c]
-        max_pool = max_pool.view([b, c])
-        avg_pool = avg_pool.view([b, c])
+        q = q.mean(-2).permute(2, 0, 1)
+        k = k.mean(-2).permute(2, 0, 1)
+        v = v.mean(-2).permute(2, 0, 1)
 
-        # 第一个全连接层下降通道数 [b,c]==>[b,c//4]
-
-        x_maxpool = self.fc1(max_pool)
-        x_avgpool = self.fc1(avg_pool)
-
-        # 激活函数
-        x_maxpool = self.relu(x_maxpool)
-        x_avgpool = self.relu(x_avgpool)
-
-        # 第二个全连接层恢复通道数 [b,c//4]==>[b,c]
-        # （可以换成1x1的卷积，效果相同）
-        x_maxpool = self.fc2(x_maxpool)
-        x_avgpool = self.fc2(x_avgpool)
-
-        # 将这两种池化结果相加 [b,c]==>[b,c]
-        x = x_maxpool + x_avgpool
-
-        # sigmoid函数权值归一化
-        x = self.sigmoid(x)
-
-        # 调整维度 [b,c]==>[b,c,1,1]
-        x = x.view([b, c, 1, 1])
-
-        # 输入特征图和通道权重相乘 [b,c,h,w]
-        outputs = inputs * x
-
-        return outputs
+        attn_output, _ = self.attention(q, k, v)
+        attn_output = attn_output.permute(1, 2, 0).mean(dim=-1)
+        scale = torch.sigmoid(attn_output.view(b, c, 1, 1))
+        return inputs * scale * 0.1 + inputs * (torch.sigmoid(avg_pool) + torch.sigmoid(max_pool) + torch.sigmoid(conv_pool)) * 0.05 + inputs
 
 
-class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
+class CDFM(nn.Module):
+    def __init__(self, feature_dim=16, latent_dim=64):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.latent_dim = latent_dim
 
-        # Define the encoder blocks
-        self.enc1 = self.double_conv(n_channels, 32)
-        self.enc2 = self.double_conv(32, 64)
-        self.enc3 = self.double_conv(64, 128)
-        self.enc4 = self.double_conv(128, 256)
-        # Define the max pooling layer
-        self.maxpool = nn.MaxPool2d(2)
-        # Define the decoder blocks
-        self.dec1 = self.up_conv(256, 128)
-        self.dec2 = self.up_conv(128, 64)
-        self.dec3 = self.up_conv(64, 32)
-        # Define the output layer
-        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)
-
-    def double_conv(self, in_ch, out_ch):
-        # Define a block of two convolutional layers with batch normalization and ReLU activation
-        conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+        self.joint_encoder = nn.Sequential(
+            nn.Conv1d(2 * feature_dim, latent_dim // 2, 1),
+            Mish(),
+            nn.Conv1d(latent_dim // 2, 2 * latent_dim, 1)
         )
 
-        return conv
-
-    def up_conv(self, in_ch, out_ch):
-        # Define a block of one up-convolutional layer and one double convolutional block
-        upconv = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        self.decoder = nn.Sequential(
+            nn.Conv1d(latent_dim + feature_dim, 2 * feature_dim, 1),
+            Mish(),
+            nn.Conv1d(2 * feature_dim, feature_dim, 1)
         )
-        return upconv
 
-    def forward(self, x):
-        # Forward pass of the network# Encoding part
-        b, c, h, w = x.shape
-        x = torch.nn.functional.interpolate(x, (384, 1248), mode='bilinear', align_corners=False)
-        x1 = self.enc1(x)
-        x2 = self.maxpool(x1)
-        x3 = self.enc2(x2)
-        x4 = self.maxpool(x3)
-        x5 = self.enc3(x4)
-        x6 = self.maxpool(x5)
-        x7 = self.enc4(x6)
-        # Decoding part
+        self.enhance = nn.Sequential(
+            nn.Conv1d(feature_dim, feature_dim, 3, padding=1, groups=8),
+            Mish(),
+            nn.Conv1d(feature_dim, feature_dim, 1)
+        )
 
-        x8 = self.dec1(x7) + x5
-        x9 = self.dec2(x8) + x3
-        x10 = self.dec3(x9) + x1
-        # Output layer
-        output = self.outc(x10)
-        aa = (384 - h) // 2
-        bb = (1248 - w) // 2
-        output = output[:, :, aa:h + aa, bb:w + bb]
-        return output
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, img_feat, vox_feat):
+        _, feat_dim, _ = img_feat.shape
+
+        joint_feat = torch.cat([img_feat, vox_feat], dim=1)
+        dist_params = self.joint_encoder(joint_feat)
+        mu, logvar = dist_params.chunk(2, dim=1)
+
+        z = self.reparameterize(mu, logvar)
+
+        img_cond = torch.cat([mu, img_feat], dim=1)
+        vox_cond = torch.cat([logvar, vox_feat], dim=1)
+
+        img_res = self.decoder(img_cond)
+        vox_res = self.decoder(vox_cond)
+
+        fused_img = F.normalize(self.enhance(img_res), dim=-1) + img_feat
+        fused_vox = F.normalize(self.enhance(vox_res), dim=-1) + vox_feat
+
+        alpha = torch.sigmoid((fused_img + fused_vox).mean(dim=1, keepdim=True))
+        final_img = 0.1 * alpha * img_feat + (1 - alpha) * 0.01 * fused_img + img_feat
+        final_vox = (1 - alpha) * 0.01 * fused_vox + 0.1 * alpha * vox_feat + vox_feat
+
+        return final_img, final_vox
+
+
+class DMM(nn.Module):
+    def __init__(self, feature_dim=16, latent_dim=64):
+        super().__init__()
+        self.fusion_core = CDFM(feature_dim, latent_dim)
+        self.proj = nn.Conv1d(feature_dim, feature_dim, 1)
+
+    def forward(self, img_feat, vox_feat):
+        final_img, final_vox = self.fusion_core(img_feat, vox_feat)
+
+        img_out = self.proj(img_feat + final_img)
+        vox_out = self.proj(vox_feat + final_vox)
+
+        batch_size, feat_dim, seq_len = img_out.shape
+        img_out_flat = img_out.transpose(1, 2).reshape(batch_size * seq_len, feat_dim)
+        vox_out_flat = vox_out.transpose(1, 2).reshape(batch_size * seq_len, feat_dim)
+
+        return img_out_flat, vox_out_flat, final_img, final_vox
 
 
 class FocalSparseConv(spconv.SparseModule):
@@ -267,8 +140,12 @@ class FocalSparseConv(spconv.SparseModule):
     def __init__(self, inplanes, planes, voxel_stride, norm_fn=None, indice_key=None,
                  image_channel=3, kernel_size=3, padding=1, mask_multi=False, use_img=False,
                  topk=False, threshold=0.5, skip_mask_kernel=False, enlarge_voxel_channels=-1,
-                 point_cloud_range=[-3, -40, 0, 1, 40, 70.4],
-                 voxel_size=[0.1, 0.05, 0.05]):
+                 point_cloud_range=None, voxel_size=None,
+                 visualize_heatmap=True, vis_frame_ids=None):
+        if point_cloud_range is None:
+            point_cloud_range = [-3, -40, 0, 1, 40, 70.4]
+        if voxel_size is None:
+            voxel_size = [0.1, 0.05, 0.05]
         super(FocalSparseConv, self).__init__()
 
         self.conv = spconv.SubMConv3d(inplanes, planes, kernel_size=kernel_size, stride=1, bias=False,
@@ -284,6 +161,21 @@ class FocalSparseConv(spconv.SparseModule):
         self.mask_multi = mask_multi
         self.skip_mask_kernel = skip_mask_kernel
         self.use_img = use_img
+
+        # 缓存：存储融合过程的中间特征用于分阶段BEV可视化
+        self._vis_cache = None
+
+        # 可视化开关
+        self.visualize_heatmap = visualize_heatmap
+        self.vis_frame_ids = vis_frame_ids  # None=全部帧, 或指定列表如 ['000008']
+        self.vis_step = 0
+        # 层标识（防止不同层的文件互相覆盖）
+        self.vis_name = indice_key if indice_key else f'focal_{id(self)}'
+        # 热力图保存目录（使用绝对路径）
+        self.vis_dir = os.path.abspath('./heatmap_output')
+        if self.visualize_heatmap and not os.path.exists(self.vis_dir):
+            os.makedirs(self.vis_dir)
+            print(f"[BEV vis] heatmap output dir: {self.vis_dir}")
 
         voxel_channel = enlarge_voxel_channels if enlarge_voxel_channels > 0 else inplanes
         in_channels = image_channel + voxel_channel if use_img else voxel_channel
@@ -305,24 +197,147 @@ class FocalSparseConv(spconv.SparseModule):
         self.inv_idx = torch.Tensor([2, 1, 0]).long().cuda()
         self.point_cloud_range = torch.Tensor(point_cloud_range).cuda()
         self.voxel_size = torch.Tensor(voxel_size).cuda()
-        # self.ASPP = ASPP()
-        # self.SE = SE(in_channel=16,ratio=4)
-        # self.spatial_attention = spatial_attention(kernel_size=7)
-        # self.channel_attention = channel_attention(in_channel=16,ratio=4)
-        self.UNet = UNet(n_channels=16, n_classes=16)
 
+        self.Mish = Mish()
+        self.DPWS = DPWS(in_channel=16, reduction=8)
+        self.CDFM = CDFM(feature_dim=16, latent_dim=64)
+        self.DMM = DMM(feature_dim=16, latent_dim=64)
+
+    # ------------------------------------------------------------------
+    # 将gt_boxes 3D框转为BEV网格像素坐标，用于画在热力图上
+    # ------------------------------------------------------------------
+    def _get_bev_gt_boxes(self, batch_dict, batch_id, down):
+        gt_boxes = batch_dict['gt_boxes'][batch_id].detach().cpu().numpy()
+        pc = self.point_cloud_range.cpu().numpy()
+        vs = self.voxel_size.cpu().numpy()
+        valid = gt_boxes[:, -1] >= 0
+        gt_boxes = gt_boxes[valid]
+        if len(gt_boxes) == 0:
+            return []
+        cx = (gt_boxes[:, 0] - pc[2]) / vs[2] / down
+        cy = (gt_boxes[:, 1] - pc[1]) / vs[1] / down
+        lp = gt_boxes[:, 4] / vs[2] / down
+        wp = gt_boxes[:, 3] / vs[1] / down
+        heading = gt_boxes[:, 6]
+        return list(zip(cx, cy, lp, wp, heading))
+
+    def _draw_bev_boxes(self, ax, gt_boxes_bev):
+        """在BEV热力图上绘制gt_boxes矩形框"""
+        for box in gt_boxes_bev:
+            cx, cy, l, w, heading = box
+            cos_h, sin_h = np.cos(heading), np.sin(heading)
+            corners = []
+            for dx, dy in [(-l/2, -w/2), (l/2, -w/2), (l/2, w/2), (-l/2, w/2)]:
+                rx = cx + dx * cos_h - dy * sin_h
+                ry = cy + dx * sin_h + dy * cos_h
+                corners.append([rx, ry])
+            polygon = patches.Polygon(corners, fill=False, edgecolor='lime', linewidth=1.0)
+            ax.add_patch(polygon)
+
+    # ------------------------------------------------------------------
+    # BEV视角下原始图像特征 + 原始点云特征的逐通道(16)热力图
+    # 图像特征：体素投影到2D图像→采样特征→按体素BEV坐标填回BEV网格
+    # 点云特征：稀疏体素特征→按体素BEV坐标转换为密集BEV网格
+    # 两者使用相同体素的BEV坐标，保证对齐
+    # ------------------------------------------------------------------
+    def visualize_fusion_stages(self, x, batch_dict, target_dim=1600):
+        """可视化融合过程的5个阶段：
+        1-2. CDFM的图像/LiDAR BEV输入
+        3-4. CDFM输出的两种模态
+        5. DMM输出的融合特征
+        所有图叠加黑底白点的点云BEV视图
+        """
+        if not self.visualize_heatmap or self._vis_cache is None:
+            return
+
+        cache = self._vis_cache.get(0, None)
+        if cache is None:
+            return
+
+        voxel_indices = cache['indices']  # (N, 4) = [batch, z, y, x]
+        pc = self.point_cloud_range.cpu().numpy()
+        vs = self.voxel_size.cpu().numpy()
+        stride = self.voxel_stride
+
+        # BEV网格大小
+        bev_rows = int((pc[5] - pc[2]) / vs[2])  # X(forward) → rows
+        bev_cols = int((pc[4] - pc[1]) / vs[1])  # Y(left-right) → cols
+        down = max(1, max(bev_rows, bev_cols) // target_dim)
+        rows_small, cols_small = bev_rows // down, bev_cols // down
+
+        # 体素的BEV像素坐标
+        x_full = voxel_indices[:, 3].astype(np.int64) * stride
+        y_full = voxel_indices[:, 2].astype(np.int64) * stride
+        row_bin = (x_full // down).astype(int)
+        col_bin = (y_full // down).astype(int)
+        valid = (row_bin >= 0) & (row_bin < rows_small) & (col_bin >= 0) & (col_bin < cols_small)
+        row_bin_v = row_bin[valid]
+        col_bin_v = col_bin[valid]
+
+        # 黑底白点的占据网格
+        occupancy = np.zeros((rows_small, cols_small), dtype=np.float32)
+        occupancy[row_bin_v, col_bin_v] = 1.0
+
+        frame_tag = f"frame{batch_dict['frame_id'][0]}" if 'frame_id' in batch_dict else f'step{self.vis_step}'
+
+        stages = [
+            ('input_img', 'Input_Image'),
+            ('input_lidar', 'Input_LiDAR'),
+            ('output_img', 'Output_Image'),
+            ('output_lidar', 'Output_LiDAR'),
+            ('fused', 'Fused'),
+        ]
+
+        for key, name_tag in stages:
+            if key not in cache:
+                continue
+
+            feats = cache[key]          # (N, 16)
+            feats_v = feats[valid]      # 只取有效BEV位置的体素
+            n_valid = feats_v.shape[0]
+            if n_valid == 0:
+                continue
+
+            for ch in range(feats_v.shape[1]):
+                feat_ch = feats_v[:, ch]
+
+                # 投影到BEV
+                bev_vals = np.zeros((rows_small, cols_small), dtype=np.float32)
+                cnt_map = np.zeros((rows_small, cols_small), dtype=np.int32)
+                for i in range(n_valid):
+                    r, c = row_bin_v[i], col_bin_v[i]
+                    bev_vals[r, c] += feat_ch[i]
+                    cnt_map[r, c] += 1
+                data_mask = cnt_map > 0
+                bev_vals[data_mask] /= cnt_map[data_mask]
+
+                # 归一化
+                fm = bev_vals.copy()
+                dv = fm[data_mask]
+                if len(dv) > 0:
+                    lo, hi = np.percentile(dv, [2, 98])
+                    fm = np.clip((fm - lo) / (hi - lo), 0, 1) if hi > lo else fm
+                    fm[data_mask] = np.where(hi > lo, fm[data_mask], 0.5)
+
+                # 原始 colormap（jet）
+                heat_rgb = plt.cm.jet(fm)[:, :, :3]
+                canvas = heat_rgb.copy()
+                # 白色点云叠加
+                occ_mask = occupancy > 0
+                canvas[occ_mask] = canvas[occ_mask] * 0.65 + np.array([1.0, 1.0, 1.0]) * 0.35
+
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.imshow(canvas, origin='upper')
+                ax.axis('off')
+                fig.savefig(os.path.join(self.vis_dir, f'bev_fusion_{name_tag}_ch{ch}_{self.vis_name}_{frame_tag}.png'),
+                            bbox_inches='tight', pad_inches=0, dpi=150)
+                plt.close(fig)
+            print(f"[VIS] Saved fusion stage: {name_tag}")
+
+    # ------------------------------------------------------------------
+    # 原有的方法（construct_multimodal_features, _gen_sparse_features等）
+    # ------------------------------------------------------------------
     def construct_multimodal_features(self, x, x_rgb, batch_dict, fuse_sum=False):
-        """
-            Construct the multimodal features with both lidar sparse features and image features.
-            Args:
-                x: [N, C] lidar sparse features
-                x_rgb: [b, c, h, w] image features
-                batch_dict: input and output information during forward
-                fuse_sum: bool, manner for fusion, True - sum, False - concat
-
-            Return:
-                image_with_voxelfeatures: [N, C] fused multimodal features
-        """
         batch_index = x.indices[:, 0]
         spatial_indices = x.indices[:, 1:] * self.voxel_stride
         voxels_3d = spatial_indices * self.voxel_size + self.point_cloud_range[:3]
@@ -333,71 +348,64 @@ class FocalSparseConv(spconv.SparseModule):
         if not x_rgb.shape == batch_dict['images'].shape:
             x_rgb = nn.functional.interpolate(x_rgb, (h, w), mode='bilinear')
 
-        image_with_voxelfeatures = []
-        voxels_2d_int_list = []
-        filter_idx_list = []
-        # x_rgb = self.ASPP(x_rgb)
-        # x_rgb =self.SE(x_rgb)
-        ####together####
-        # x_rgb = self.spatial_attention(x_rgb)
-        # x_rgb = self.channel_attention(x_rgb)
-        x_rgb = self.UNet(x_rgb)
+        x_rgb = self.DPWS(x_rgb)
 
+        image_with_voxelfeatures = []
         for b in range(batch_size):
             x_rgb_batch = x_rgb[b]
-
             calib = calibs[b]
             voxels_3d_batch = voxels_3d[batch_index == b]
             voxel_features_sparse = x.features[batch_index == b]
 
-            # Reverse the point cloud transformations to the original coords.
             if 'noise_scale' in batch_dict:
                 voxels_3d_batch[:, :3] /= batch_dict['noise_scale'][b]
             if 'noise_rot' in batch_dict:
                 voxels_3d_batch = common_utils.rotate_points_along_z(voxels_3d_batch[:, self.inv_idx].unsqueeze(0),
-                                                                     -batch_dict['noise_rot'][b].unsqueeze(0))[
-                    0, :, self.inv_idx]
+                                                                     -batch_dict['noise_rot'][b].unsqueeze(0))[0, :,
+                                  self.inv_idx]
             if 'flip_x' in batch_dict:
                 voxels_3d_batch[:, 1] *= -1 if batch_dict['flip_x'][b] else 1
             if 'flip_y' in batch_dict:
                 voxels_3d_batch[:, 2] *= -1 if batch_dict['flip_y'][b] else 1
 
             voxels_2d, _ = calib.lidar_to_img(voxels_3d_batch[:, self.inv_idx].cpu().numpy())
-
             voxels_2d_int = torch.Tensor(voxels_2d).to(x_rgb_batch.device).long()
-
             filter_idx = (0 <= voxels_2d_int[:, 1]) * (voxels_2d_int[:, 1] < h) * (0 <= voxels_2d_int[:, 0]) * (
                         voxels_2d_int[:, 0] < w)
 
-            filter_idx_list.append(filter_idx)
             voxels_2d_int = voxels_2d_int[filter_idx]
-            voxels_2d_int_list.append(voxels_2d_int)
-
             image_features_batch = torch.zeros((voxel_features_sparse.shape[0], x_rgb_batch.shape[0]),
                                                device=x_rgb_batch.device)
             image_features_batch[filter_idx] = x_rgb_batch[:, voxels_2d_int[:, 1], voxels_2d_int[:, 0]].permute(1, 0)
 
-            if fuse_sum:
-                image_with_voxelfeature = image_features_batch + voxel_features_sparse
-            else:
-                image_with_voxelfeature = torch.cat([image_features_batch, voxel_features_sparse], dim=1)
+            image_features_batch = image_features_batch.permute(1, 0).reshape(1, 16, -1)
+            voxel_features_sparse = voxel_features_sparse.permute(1, 0).reshape(1, 16, -1)
 
-            ############## Add ASPP
+            img_out_flat, vox_out_flat, final_img, final_vox = self.DMM(image_features_batch, voxel_features_sparse)
+
+            # 缓存中间特征用于分阶段BEV可视化
+            if self._vis_cache is not None:
+                vox_indices_b = x.indices[batch_index == b].detach().cpu().numpy()
+                self._vis_cache[int(b)] = {
+                    'indices': vox_indices_b,
+                    'input_img': image_features_batch.squeeze(0).detach().cpu().numpy().T,
+                    'input_lidar': voxel_features_sparse.squeeze(0).detach().cpu().numpy().T,
+                    'output_img': final_img.squeeze(0).detach().cpu().numpy().T,
+                    'output_lidar': final_vox.squeeze(0).detach().cpu().numpy().T,
+                    'fused': (img_out_flat + vox_out_flat).detach().cpu().numpy(),
+                }
+
+            if fuse_sum:
+                image_with_voxelfeature = img_out_flat + vox_out_flat
+            else:
+                image_with_voxelfeature = torch.cat([img_out_flat, vox_out_flat], dim=1)
 
             image_with_voxelfeatures.append(image_with_voxelfeature)
 
-        image_with_voxelfeatures = torch.cat(image_with_voxelfeatures)
+        image_with_voxelfeatures = torch.cat(image_with_voxelfeatures, dim=0)
         return image_with_voxelfeatures
 
     def _gen_sparse_features(self, x, imps_3d, batch_dict, voxels_3d):
-        """
-            Generate the output sparse features from the focal sparse conv.
-            Args:
-                x: [N, C], lidar sparse features
-                imps_3d: [N, kernelsize**3], the predicted importance values
-                batch_dict: input and output information during forward
-                voxels_3d: [N, 3], the 3d positions of voxel centers
-        """
         batch_size = x.batch_size
         voxel_features_fore = []
         voxel_indices_fore = []
@@ -419,13 +427,10 @@ class FocalSparseConv(spconv.SparseModule):
                 box_of_pts_batch = points_in_boxes_gpu(voxels_3d_batch[:, :, self.inv_idx], gt_boxes).squeeze(0)
                 box_of_pts_cls_targets.append(box_of_pts_batch >= 0)
 
-            features_fore, indices_fore, features_back, indices_back, mask_kernel = split_voxels(x, b, imps_3d,
-                                                                                                 voxels_3d,
-                                                                                                 self.kernel_offsets,
-                                                                                                 mask_multi=self.mask_multi,
-                                                                                                 topk=self.topk,
-                                                                                                 threshold=self.threshold)
-
+            features_fore, indices_fore, features_back, indices_back, mask_kernel = split_voxels(
+                x, b, imps_3d, voxels_3d, self.kernel_offsets,
+                mask_multi=self.mask_multi, topk=self.topk, threshold=self.threshold
+            )
             mask_kernel_list.append(mask_kernel)
             voxel_features_fore.append(features_fore)
             voxel_indices_fore.append(indices_fore)
@@ -451,13 +456,6 @@ class FocalSparseConv(spconv.SparseModule):
         return x_fore, x_back, loss_box_of_pts, mask_kernel
 
     def combine_out(self, x_fore, x_back, remove_repeat=False):
-        """
-            Combine the foreground and background sparse features together.
-            Args:
-                x_fore: [N1, C], foreground sparse features
-                x_back: [N2, C], background sparse features
-                remove_repeat: bool, whether to remove the spatial replicate features.
-        """
         x_fore_features = torch.cat([x_fore.features, x_back.features], dim=0)
         x_fore_indices = torch.cat([x_fore.indices, x_back.indices], dim=0)
 
@@ -467,8 +465,9 @@ class FocalSparseConv(spconv.SparseModule):
             indices_coords_out_list = []
             for b in range(x_fore.batch_size):
                 batch_index = index == b
-                features_out, indices_coords_out, _ = check_repeat(x_fore_features[batch_index],
-                                                                   x_fore_indices[batch_index], flip_first=False)
+                features_out, indices_coords_out, _ = check_repeat(
+                    x_fore_features[batch_index], x_fore_indices[batch_index], flip_first=False
+                )
                 features_out_list.append(features_out)
                 indices_coords_out_list.append(indices_coords_out)
             x_fore_features = torch.cat(features_out_list, dim=0)
@@ -476,21 +475,29 @@ class FocalSparseConv(spconv.SparseModule):
 
         x_fore = x_fore.replace_feature(x_fore_features)
         x_fore.indices = x_fore_indices
-
         return x_fore
 
     def forward(self, x, batch_dict, x_rgb=None):
+        # 可视化缓存：仅当指定帧或无限制时初始化
+        _do_vis = self.visualize_heatmap and self.use_img
+        if _do_vis and self.vis_frame_ids is not None:
+            _fid = batch_dict['frame_id'][0] if 'frame_id' in batch_dict else None
+            _do_vis = _fid in self.vis_frame_ids
+        self._vis_cache = {} if _do_vis else None
+
         spatial_indices = x.indices[:, 1:] * self.voxel_stride
         voxels_3d = spatial_indices * self.voxel_size + self.point_cloud_range[:3]
 
         if self.use_img:
-            features_multimodal = self.construct_multimodal_features(x, x_rgb, batch_dict)
+            features_multimodal = self.construct_multimodal_features(x, x_rgb, batch_dict, fuse_sum=False)
             x_predict = spconv.SparseConvTensor(features_multimodal, x.indices, x.spatial_shape, x.batch_size)
+
+            # 可视化融合过程的5个阶段
+            self.visualize_fusion_stages(x, batch_dict)
         else:
             x_predict = self.conv_enlarge(x) if self.conv_enlarge else x
 
         imps_3d = self.conv_imp(x_predict).features
-
         x_fore, x_back, loss_box_of_pts, mask_kernel = self._gen_sparse_features(x, imps_3d, batch_dict, voxels_3d)
 
         if not self.skip_mask_kernel:
@@ -499,9 +506,13 @@ class FocalSparseConv(spconv.SparseModule):
         out = self.conv(out)
 
         if self.use_img:
-            out = out.replace_feature(self.construct_multimodal_features(out, x_rgb, batch_dict, True))
+            out = out.replace_feature(self.construct_multimodal_features(out, x_rgb, batch_dict, fuse_sum=True))
 
         out = out.replace_feature(self.bn1(out.features))
         out = out.replace_feature(self.relu(out.features))
+
+        # 更新全局步数（用于文件名）
+        if self.visualize_heatmap:
+            self.vis_step += 1
 
         return out, batch_dict, loss_box_of_pts
